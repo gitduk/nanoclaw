@@ -47,3 +47,7 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Dashboard: auto-enable when running in interactive terminal
+export const DASHBOARD_ENABLED =
+  (process.stdout.isTTY ?? false) && process.env.DASHBOARD !== 'false';

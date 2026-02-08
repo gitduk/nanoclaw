@@ -6,7 +6,7 @@
 import path from 'path';
 import fs from 'fs';
 import { logger } from './logger.js';
-import { runAgent, AgentInput, AgentOutput } from './agent/runner.js';
+import { runAgent, AgentInput, AgentOutput, OnProgressCallback } from './agent/runner.js';
 import { PATHS } from './config.js';
 
 export interface RunAgentOptions {
@@ -16,6 +16,7 @@ export interface RunAgentOptions {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  onProgress?: OnProgressCallback;
 }
 
 /**
@@ -55,7 +56,7 @@ export async function runAgentForGroup(options: RunAgentOptions): Promise<AgentO
   };
 
   try {
-    const output = await runAgent(input);
+    const output = await runAgent(input, options.onProgress);
 
     if (output.status === 'success') {
       logger.info({ group: groupFolder, outputType: output.result?.outputType }, 'Agent completed successfully');

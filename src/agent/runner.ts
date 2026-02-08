@@ -53,6 +53,13 @@ export interface AgentOutput {
   error?: string;
 }
 
+export type OnProgressCallback = (event: AgentProgressEvent) => void;
+
+export interface AgentProgressEvent {
+  type: 'text' | 'tool_use' | 'tool_summary';
+  text: string;
+}
+
 interface SessionEntry {
   sessionId: string;
   fullPath: string;
@@ -205,7 +212,7 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 /**
  * Run the agent with the given input
  */
-export async function runAgent(input: AgentInput): Promise<AgentOutput> {
+export async function runAgent(input: AgentInput, onProgress?: OnProgressCallback): Promise<AgentOutput> {
   const ipcMcp = createIpcMcp({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
@@ -257,6 +264,31 @@ export async function runAgent(input: AgentInput): Promise<AgentOutput> {
     })) {
       if (message.type === 'system' && message.subtype === 'init') {
         newSessionId = message.session_id;
+      }
+
+      // Stream progress events to dashboard
+      if (onProgress) {
+        if (message.type === 'assistant') {
+          const blocks = (message as any).message?.content ?? [];
+          // Skip assistant messages that contain StructuredOutput (internal SDK tool)
+          const hasStructuredOutput = blocks.some(
+            (b: any) => b.type === 'tool_use' && b.name === 'StructuredOutput'
+          );
+          if (!hasStructuredOutput) {
+            for (const block of blocks) {
+              if (block.type === 'text' && block.text) {
+                onProgress({ type: 'text', text: block.text });
+              } else if (block.type === 'tool_use' && block.name) {
+                onProgress({ type: 'tool_use', text: block.name });
+              }
+            }
+          }
+        } else if (message.type === 'tool_use_summary') {
+          const summary = (message as any).summary as string;
+          if (summary && !summary.includes('StructuredOutput')) {
+            onProgress({ type: 'tool_summary', text: summary });
+          }
+        }
       }
 
       if (message.type === 'result') {

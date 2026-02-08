@@ -5,6 +5,7 @@ import path from 'path';
 import makeWASocket, {
   DisconnectReason,
   WASocket,
+  jidNormalizedUser,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -15,11 +16,22 @@ import {
   DATA_DIR,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
+  MAX_CONCURRENT_AGENTS,
   POLL_INTERVAL,
   STORE_DIR,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
+import {
+  destroyDashboard,
+  incrementMessages,
+  initDashboard,
+  pushThinkingLine,
+  setActiveAgents,
+  setConnectionStatus,
+  setGroupStatus,
+  setGroups,
+} from './dashboard.js';
 import {
   runAgentForGroup,
 } from './agent-runner.js';
@@ -74,17 +86,38 @@ let shuttingDown = false;
 const queue = new GroupQueue();
 
 /**
- * Translate a JID from LID format to phone format if we have a mapping.
+ * Translate a JID from LID format to phone format.
+ * Uses local cache first, then queries Baileys' signal repository for the mapping.
  * Returns the original JID if no mapping exists.
  */
-function translateJid(jid: string): string {
+async function translateJid(jid: string): Promise<string> {
   if (!jid.endsWith('@lid')) return jid;
   const lidUser = jid.split('@')[0].split(':')[0];
-  const phoneJid = lidToPhoneMap[lidUser];
-  if (phoneJid) {
-    logger.debug({ lidJid: jid, phoneJid }, 'Translated LID to phone JID');
-    return phoneJid;
+
+  // Check local cache first
+  const cached = lidToPhoneMap[lidUser];
+  if (cached) {
+    logger.debug({ lidJid: jid, phoneJid: cached }, 'Translated LID to phone JID (cached)');
+    return cached;
   }
+
+  // Query Baileys signal repository for LID → PN mapping
+  try {
+    const pnJid = await sock.signalRepository.lidMapping.getPNForLID(jid);
+    if (pnJid) {
+      // getPNForLID returns device-specific JID like "8615672605609:0@s.whatsapp.net"
+      // Normalize to strip device part for chat matching
+      const normalized = jidNormalizedUser(pnJid);
+      if (normalized) {
+        lidToPhoneMap[lidUser] = normalized;
+        logger.info({ lidJid: jid, phoneJid: normalized }, 'Resolved LID to phone JID via signal store');
+        return normalized;
+      }
+    }
+  } catch (err) {
+    logger.debug({ jid, err }, 'Failed to resolve LID via signal repository');
+  }
+
   return jid;
 }
 
@@ -130,6 +163,7 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
+  setGroups(registeredGroups);
   logger.info(
     { jid, name: group.name, folder: group.folder },
     'Group registered',
@@ -236,13 +270,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  // Show user messages in dashboard before agent starts thinking
+  for (const m of missedMessages) {
+    pushThinkingLine(`[${group.name}] ${m.sender_name}: ${m.content.split('\n')[0]}`);
+  }
+
   await setTyping(chatJid, true);
   const response = await runAgent(group, prompt, chatJid);
   await setTyping(chatJid, false);
 
-  if (response === 'error') {
-    // Container or agent error — signal failure so queue can retry with backoff
-    return false;
+  if ('error' in response) {
+    await sendMessage(chatJid, `[Agent Error] ${response.error}`);
+    // Advance timestamp so these messages aren't reprocessed on every new incoming message.
+    lastAgentTimestamp[chatJid] =
+      missedMessages[missedMessages.length - 1].timestamp;
+    saveState();
+    return true;
   }
 
   // Agent processed messages successfully (whether it responded or stayed silent)
@@ -268,7 +311,7 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
-): Promise<AgentResponse | 'error'> {
+): Promise<AgentResponse | { error: string }> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
 
@@ -304,6 +347,19 @@ async function runAgent(
       groupFolder: group.folder,
       chatJid,
       isMain,
+      onProgress: (event) => {
+        const prefix = `[${group.name}] `;
+        if (event.type === 'text') {
+          const firstLine = event.text.split('\n')[0];
+          if (firstLine.trim()) {
+            pushThinkingLine(`${prefix}${firstLine}`);
+          }
+        } else if (event.type === 'tool_use') {
+          pushThinkingLine(`${prefix}\u21BB ${event.text}`);
+        } else if (event.type === 'tool_summary') {
+          pushThinkingLine(`${prefix}${event.text}`);
+        }
+      },
     });
 
     if (output.newSessionId) {
@@ -316,13 +372,14 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Agent error',
       );
-      return 'error';
+      return { error: output.error || 'Unknown agent error' };
     }
 
     return output.result ?? { outputType: 'log' };
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
+    return { error: errorMessage };
   }
 }
 
@@ -697,6 +754,7 @@ async function connectWhatsApp(): Promise<void> {
     printQRInTerminal: false,
     logger,
     browser: ['NanoClaw', 'Chrome', '1.0.0'],
+    shouldSyncHistoryMessage: () => false,
   });
 
   sock.ev.on('connection.update', (update) => {
@@ -714,10 +772,16 @@ async function connectWhatsApp(): Promise<void> {
 
     if (connection === 'close') {
       const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
+      const shouldReconnect =
+        reason !== DisconnectReason.loggedOut &&
+        reason !== DisconnectReason.connectionReplaced;
+      setConnectionStatus(shouldReconnect ? 'reconnecting' : 'disconnected');
       logger.info({ reason, shouldReconnect }, 'Connection closed');
 
-      if (shouldReconnect) {
+      if (reason === DisconnectReason.connectionReplaced) {
+        logger.error('Another session took over this connection. Exiting to avoid conflict loop.');
+        process.exit(1);
+      } else if (shouldReconnect) {
         logger.info('Reconnecting...');
         connectWhatsApp();
       } else {
@@ -725,6 +789,7 @@ async function connectWhatsApp(): Promise<void> {
         process.exit(0);
       }
     } else if (connection === 'open') {
+      setConnectionStatus('connected');
       logger.info('Connected to WhatsApp');
 
       // Build LID to phone mapping from auth state for self-chat translation
@@ -758,6 +823,12 @@ async function connectWhatsApp(): Promise<void> {
       });
       startIpcWatcher();
       queue.setProcessMessagesFn(processGroupMessages);
+      queue.setOnStateChange(() => {
+        setActiveAgents(queue.getActiveCount());
+        for (const jid of Object.keys(registeredGroups)) {
+          setGroupStatus(jid, queue.getGroupStatus(jid));
+        }
+      });
       recoverPendingMessages();
       startMessageLoop();
     }
@@ -766,31 +837,35 @@ async function connectWhatsApp(): Promise<void> {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('messages.upsert', ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message) continue;
-      const rawJid = msg.key.remoteJid;
-      if (!rawJid || rawJid === 'status@broadcast') continue;
+    (async () => {
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        const rawJid = msg.key.remoteJid;
+        if (!rawJid || rawJid === 'status@broadcast') continue;
 
-      // Translate LID JID to phone JID if applicable
-      const chatJid = translateJid(rawJid);
+        // Translate LID JID to phone JID if applicable
+        const chatJid = await translateJid(rawJid);
 
-      const timestamp = new Date(
-        Number(msg.messageTimestamp) * 1000,
-      ).toISOString();
+        const timestamp = new Date(
+          Number(msg.messageTimestamp) * 1000,
+        ).toISOString();
 
-      // Always store chat metadata for group discovery
-      storeChatMetadata(chatJid, timestamp);
+        // Always store chat metadata for group discovery
+        storeChatMetadata(chatJid, timestamp);
 
-      // Only store full message content for registered groups
-      if (registeredGroups[chatJid]) {
-        storeMessage(
-          msg,
-          chatJid,
-          msg.key.fromMe || false,
-          msg.pushName || undefined,
-        );
+        // Only store full message content for registered groups
+        if (registeredGroups[chatJid]) {
+          storeMessage(
+            msg,
+            chatJid,
+            msg.key.fromMe || false,
+            msg.pushName || undefined,
+          );
+        }
       }
-    }
+    })().catch((err) => {
+      logger.error({ err }, 'Error in messages.upsert handler');
+    });
   });
 }
 
@@ -813,6 +888,7 @@ async function startMessageLoop(): Promise<void> {
       );
 
       if (messages.length > 0) {
+        incrementMessages(messages.length);
         logger.info({ count: messages.length }, 'New messages');
 
         // Advance the "seen" cursor for all messages immediately
@@ -857,9 +933,12 @@ function recoverPendingMessages(): void {
 }
 
 async function main(): Promise<void> {
+  initDashboard({ agentName: ASSISTANT_NAME, maxAgents: MAX_CONCURRENT_AGENTS });
+
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  setGroups(registeredGroups);
 
   // Graceful shutdown handlers
   let shutdownInProgress = false;
@@ -892,6 +971,7 @@ async function main(): Promise<void> {
     await queue.shutdown(10000);
 
     clearTimeout(forceExitTimer);
+    destroyDashboard();
     process.exit(0);
   };
 

@@ -24,6 +24,7 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  private onStateChangeFn: (() => void) | null = null;
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -41,6 +42,22 @@ export class GroupQueue {
 
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  setOnStateChange(fn: () => void): void {
+    this.onStateChangeFn = fn;
+  }
+
+  getActiveCount(): number {
+    return this.activeCount;
+  }
+
+  getGroupStatus(groupJid: string): 'idle' | 'running' | 'queued' {
+    const state = this.groups.get(groupJid);
+    if (!state) return 'idle';
+    if (state.active) return 'running';
+    if (state.pendingMessages || state.pendingTasks.length > 0) return 'queued';
+    return 'idle';
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -110,6 +127,7 @@ export class GroupQueue {
     state.active = true;
     state.pendingMessages = false;
     this.activeCount++;
+    this.onStateChangeFn?.();
 
     logger.debug(
       { groupJid, reason, activeCount: this.activeCount },
@@ -131,6 +149,7 @@ export class GroupQueue {
     } finally {
       state.active = false;
       this.activeCount--;
+      this.onStateChangeFn?.();
       this.drainGroup(groupJid);
     }
   }
@@ -139,6 +158,7 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     state.active = true;
     this.activeCount++;
+    this.onStateChangeFn?.();
 
     logger.debug(
       { groupJid, taskId: task.id, activeCount: this.activeCount },
@@ -152,6 +172,7 @@ export class GroupQueue {
     } finally {
       state.active = false;
       this.activeCount--;
+      this.onStateChangeFn?.();
       this.drainGroup(groupJid);
     }
   }
