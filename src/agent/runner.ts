@@ -222,6 +222,9 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
 
   let result: AgentResponse | null = null;
   let newSessionId: string | undefined;
+  let textBuffer = '';  // Accumulate streaming text
+  let currentToolName = '';  // Current tool being called
+  let currentToolInput = '';  // Accumulate tool input JSON
 
   // Add context for scheduled tasks
   let prompt = input.prompt;
@@ -235,6 +238,7 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
     for await (const message of query({
       prompt,
       options: {
+        executable: 'node',  // Force Node.js (not Bun) to avoid "Bun is not defined" error
         model,
         cwd: input.workspaceDir,
         resume: input.sessionId,
@@ -249,6 +253,7 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
         ],
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
+        includePartialMessages: true,  // Enable streaming events for real-time progress
         settingSources: ['project'],
         mcpServers: {
           nanoclaw: ipcMcp
@@ -268,20 +273,80 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
 
       // Stream progress events to dashboard
       if (onProgress) {
-        if (message.type === 'assistant') {
-          const blocks = (message as any).message?.content ?? [];
-          // Skip assistant messages that contain StructuredOutput (internal SDK tool)
-          const hasStructuredOutput = blocks.some(
-            (b: any) => b.type === 'tool_use' && b.name === 'StructuredOutput'
-          );
-          if (!hasStructuredOutput) {
-            for (const block of blocks) {
-              if (block.type === 'text' && block.text) {
-                onProgress({ type: 'text', text: block.text });
-              } else if (block.type === 'tool_use' && block.name) {
-                onProgress({ type: 'tool_use', text: block.name });
+        if (message.type === 'stream_event') {
+          const event = (message as any).event;
+          // Handle streaming text deltas - accumulate until newline or sentence end
+          if (event?.type === 'content_block_delta' && event?.delta?.type === 'text_delta') {
+            textBuffer += event.delta.text || '';
+            // Flush on newlines
+            const lines = textBuffer.split('\n');
+            for (let i = 0; i < lines.length - 1; i++) {
+              const line = lines[i].trim();
+              if (line) {
+                onProgress({ type: 'text', text: line });
               }
             }
+            textBuffer = lines[lines.length - 1];
+            // Also flush if buffer is long enough (for responses without newlines)
+            if (textBuffer.length > 80) {
+              // Try to break at sentence end or space
+              let breakPoint = textBuffer.lastIndexOf('。');
+              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf('. ');
+              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf('，');
+              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf(', ');
+              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf(' ');
+              if (breakPoint > 40) {
+                onProgress({ type: 'text', text: textBuffer.slice(0, breakPoint + 1).trim() });
+                textBuffer = textBuffer.slice(breakPoint + 1);
+              }
+            }
+          }
+          // Handle tool input JSON accumulation
+          else if (event?.type === 'content_block_delta' && event?.delta?.type === 'input_json_delta') {
+            currentToolInput += event.delta.partial_json || '';
+          }
+          // Handle content block end - flush text or emit tool info
+          else if (event?.type === 'content_block_stop') {
+            // Flush remaining text
+            if (textBuffer.trim()) {
+              onProgress({ type: 'text', text: textBuffer.trim() });
+            }
+            textBuffer = '';
+            // Emit tool with parsed input summary
+            if (currentToolName && currentToolName !== 'StructuredOutput') {
+              let toolSummary = currentToolName;
+              try {
+                const input = JSON.parse(currentToolInput || '{}');
+                // Extract key info based on tool type
+                if (currentToolName === 'Read' && input.file_path) {
+                  toolSummary = `Read: ${input.file_path}`;
+                } else if (currentToolName === 'Bash' && input.command) {
+                  const cmd = input.command.length > 60 ? input.command.slice(0, 60) + '...' : input.command;
+                  toolSummary = `Bash: ${cmd}`;
+                } else if (currentToolName === 'Grep' && input.pattern) {
+                  toolSummary = `Grep: ${input.pattern}`;
+                } else if (currentToolName === 'Glob' && input.pattern) {
+                  toolSummary = `Glob: ${input.pattern}`;
+                } else if (currentToolName === 'Edit' && input.file_path) {
+                  toolSummary = `Edit: ${input.file_path}`;
+                } else if (currentToolName === 'Write' && input.file_path) {
+                  toolSummary = `Write: ${input.file_path}`;
+                } else if (currentToolName.startsWith('mcp__nanoclaw__')) {
+                  const shortName = currentToolName.replace('mcp__nanoclaw__', '');
+                  toolSummary = `${shortName}`;
+                }
+              } catch {
+                // Keep just tool name if JSON parse fails
+              }
+              onProgress({ type: 'tool_use', text: toolSummary });
+            }
+            currentToolName = '';
+            currentToolInput = '';
+          }
+          // Handle tool use start - just record the name
+          else if (event?.type === 'content_block_start' && event?.content_block?.type === 'tool_use') {
+            currentToolName = event.content_block.name || '';
+            currentToolInput = '';
           }
         } else if (message.type === 'tool_use_summary') {
           const summary = (message as any).summary as string;

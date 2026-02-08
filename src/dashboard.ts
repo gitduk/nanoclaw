@@ -207,9 +207,14 @@ export function pushLogLine(line: string): void {
 /** Push a line to the thinking display and log file. */
 export function pushThinkingLine(line: string): void {
   if (!active) return;
+  const width = (process.stdout.columns || 80) - 6;  // Account for box borders and padding
   for (const l of line.split('\n')) {
     if (l.trim()) {
-      thinkingBuffer.push(l);
+      // Wrap long lines
+      const wrapped = wrapText(l, width);
+      for (const w of wrapped) {
+        thinkingBuffer.push(w);
+      }
       logFileStream?.write(l + '\n');
     }
   }
@@ -217,6 +222,33 @@ export function pushThinkingLine(line: string): void {
     thinkingBuffer.splice(0, thinkingBuffer.length - MAX_THINKING_LINES);
   }
   scheduleRender();
+}
+
+/** Wrap text to fit within maxWidth display columns. */
+function wrapText(text: string, maxWidth: number): string[] {
+  if (visibleLength(text) <= maxWidth) return [text];
+  const lines: string[] = [];
+  let remaining = text;
+  while (visibleLength(remaining) > maxWidth) {
+    // Find break point that fits within maxWidth
+    let width = 0;
+    let breakIdx = 0;
+    let lastSpaceIdx = -1;
+    for (const char of remaining) {
+      const code = char.codePointAt(0) || 0;
+      const charWidth = isWideChar(code) ? 2 : 1;
+      if (width + charWidth > maxWidth) break;
+      if (char === ' ') lastSpaceIdx = breakIdx;
+      width += charWidth;
+      breakIdx += char.length;
+    }
+    // Prefer breaking at space
+    const actualBreak = lastSpaceIdx > 0 ? lastSpaceIdx : breakIdx;
+    lines.push(remaining.slice(0, actualBreak));
+    remaining = remaining.slice(actualBreak).trimStart();
+  }
+  if (remaining) lines.push(remaining);
+  return lines;
 }
 
 // --- Rendering ---
@@ -308,12 +340,42 @@ function stripAnsi(str: string): string {
 }
 
 function visibleLength(str: string): number {
-  return stripAnsi(str).length;
+  const plain = stripAnsi(str);
+  let width = 0;
+  for (const char of plain) {
+    const code = char.codePointAt(0) || 0;
+    width += isWideChar(code) ? 2 : 1;
+  }
+  return width;
 }
 
 function truncate(str: string, maxVisible: number): string {
   if (visibleLength(str) <= maxVisible) return str;
-  return stripAnsi(str).slice(0, Math.max(0, maxVisible - 1)) + '\u2026';
+  const plain = stripAnsi(str);
+  let width = 0;
+  let i = 0;
+  for (const char of plain) {
+    const code = char.codePointAt(0) || 0;
+    const charWidth = isWideChar(code) ? 2 : 1;
+    if (width + charWidth + 1 > maxVisible) break;  // +1 for ellipsis
+    width += charWidth;
+    i += char.length;
+  }
+  return plain.slice(0, i) + '\u2026';
+}
+
+function isWideChar(code: number): boolean {
+  return (
+    (code >= 0x1100 && code <= 0x115F) ||
+    (code >= 0x2E80 && code <= 0x9FFF) ||
+    (code >= 0xAC00 && code <= 0xD7AF) ||
+    (code >= 0xF900 && code <= 0xFAFF) ||
+    (code >= 0xFE10 && code <= 0xFE1F) ||
+    (code >= 0xFE30 && code <= 0xFE6F) ||
+    (code >= 0xFF00 && code <= 0xFF60) ||
+    (code >= 0xFFE0 && code <= 0xFFE6) ||
+    (code >= 0x20000 && code <= 0x2FFFF)
+  );
 }
 
 function boxTop(width: number, title: string): string {
