@@ -9,6 +9,10 @@ const CURSOR_HIDE = '\x1b[?25l';
 const CURSOR_SHOW = '\x1b[?25h';
 const MOVE_HOME = '\x1b[H';
 const CLEAR_BELOW = '\x1b[J';
+const WRAP_OFF = '\x1b[?7l';    // Disable auto-wrap (overflow truncated, not wrapped)
+const WRAP_ON = '\x1b[?7h';     // Re-enable auto-wrap
+const SYNC_START = '\x1b[?2026h'; // Synchronized output start (batch screen updates)
+const SYNC_END = '\x1b[?2026l';   // Synchronized output end
 
 const BOLD = '\x1b[1m';
 const DIM = '\x1b[2m';
@@ -16,6 +20,7 @@ const RESET = '\x1b[0m';
 const GREEN = '\x1b[32m';
 const RED = '\x1b[31m';
 const YELLOW = '\x1b[33m';
+const CYAN = '\x1b[36m';
 
 // Box-drawing characters
 const H = '\u2500';
@@ -50,9 +55,11 @@ interface DashboardState {
 }
 
 const MAX_THINKING_LINES = 500;
+const RENDER_THROTTLE_MS = 50; // Max ~20fps to reduce flicker
 const thinkingBuffer: string[] = [];
 let active = false;
-let renderScheduled = false;
+let renderTimer: ReturnType<typeof setTimeout> | null = null;
+let lastRenderTime = 0;
 let uptimeTimer: ReturnType<typeof setInterval> | null = null;
 let logFileStream: fs.WriteStream | null = null;
 
@@ -105,6 +112,13 @@ export function initDashboard(opts: { agentName: string; maxAgents: number }): v
   // Safety net: restore terminal on exit
   process.once('exit', destroyDashboard);
 
+  // Ensure log file is closed on process termination
+  process.once('beforeExit', () => {
+    if (logFileStream && !logFileStream.closed) {
+      logFileStream.end();
+    }
+  });
+
   // Handle resize
   process.stdout.on('resize', scheduleRender);
 
@@ -126,6 +140,10 @@ export function destroyDashboard(): void {
   if (uptimeTimer) {
     clearInterval(uptimeTimer);
     uptimeTimer = null;
+  }
+  if (renderTimer) {
+    clearTimeout(renderTimer);
+    renderTimer = null;
   }
 
   // Restore console
@@ -218,7 +236,7 @@ export function pushThinkingLine(line: string): void {
       logFileStream?.write(l + '\n');
     }
   }
-  if (thinkingBuffer.length > MAX_THINKING_LINES) {
+  if (thinkingBuffer.length >= MAX_THINKING_LINES) {
     thinkingBuffer.splice(0, thinkingBuffer.length - MAX_THINKING_LINES);
   }
   scheduleRender();
@@ -254,12 +272,22 @@ function wrapText(text: string, maxWidth: number): string[] {
 // --- Rendering ---
 
 function scheduleRender(): void {
-  if (!active || renderScheduled) return;
-  renderScheduled = true;
-  setImmediate(() => {
-    renderScheduled = false;
-    if (active) render();
-  });
+  if (!active || renderTimer) return;
+  const now = Date.now();
+  const elapsed = now - lastRenderTime;
+  if (elapsed >= RENDER_THROTTLE_MS) {
+    // Enough time passed — render immediately on next tick
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      if (active) render();
+    }, 0);
+  } else {
+    // Too soon — defer to hit the throttle interval
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      if (active) render();
+    }, RENDER_THROTTLE_MS - elapsed);
+  }
 }
 
 function render(): void {
@@ -330,7 +358,12 @@ function render(): void {
   }
   buf.push(boxBottom(width));
 
-  process.stdout.write(MOVE_HOME + buf.join('\n') + CLEAR_BELOW);
+  // Synchronized output prevents flicker; auto-wrap off prevents overflow from
+  // emoji/CJK width miscalculation pushing the status bar off-screen.
+  process.stdout.write(
+    SYNC_START + WRAP_OFF + MOVE_HOME + buf.join('\n') + CLEAR_BELOW + WRAP_ON + SYNC_END
+  );
+  lastRenderTime = Date.now();
 }
 
 // --- Helpers ---
@@ -366,6 +399,7 @@ function truncate(str: string, maxVisible: number): string {
 
 function isWideChar(code: number): boolean {
   return (
+    // CJK
     (code >= 0x1100 && code <= 0x115F) ||
     (code >= 0x2E80 && code <= 0x9FFF) ||
     (code >= 0xAC00 && code <= 0xD7AF) ||
@@ -374,7 +408,11 @@ function isWideChar(code: number): boolean {
     (code >= 0xFE30 && code <= 0xFE6F) ||
     (code >= 0xFF00 && code <= 0xFF60) ||
     (code >= 0xFFE0 && code <= 0xFFE6) ||
-    (code >= 0x20000 && code <= 0x2FFFF)
+    (code >= 0x20000 && code <= 0x2FFFF) ||
+    // Emoji & symbols that render as 2 columns in terminals
+    (code >= 0x2300 && code <= 0x23FF) ||  // Misc technical (⌚⏰ etc.)
+    (code >= 0x2600 && code <= 0x27BF) ||  // Misc symbols, Dingbats (☀✅❌ etc.)
+    (code >= 0x1F000 && code <= 0x1FAFF)   // All emoji blocks (😊🎉💰🔧 etc.)
   );
 }
 

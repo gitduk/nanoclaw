@@ -54,6 +54,7 @@ import {
   getRouterState,
   getTaskById,
   initDatabase,
+  closeDatabase,
   setLastGroupSync,
   setRegisteredGroup,
   setRouterState,
@@ -73,6 +74,7 @@ const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 let sock: WASocket;
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
+const sessionLocks = new Map<string, Promise<void>>();
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 // LID to phone number mapping (WhatsApp now sends LID JIDs for self-chats)
@@ -82,8 +84,51 @@ let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let groupSyncTimerStarted = false;
 let shuttingDown = false;
+// Track message IDs sent by the bot to skip WhatsApp echo-backs
+const sentMessageIds = new Set<string>();
 
 const queue = new GroupQueue();
+
+// Display width helpers for aligned tags
+function isWideChar(code: number): boolean {
+  return (
+    (code >= 0x1100 && code <= 0x115F) ||
+    (code >= 0x2E80 && code <= 0x9FFF) ||
+    (code >= 0xAC00 && code <= 0xD7AF) ||
+    (code >= 0xF900 && code <= 0xFAFF) ||
+    (code >= 0xFE10 && code <= 0xFE1F) ||
+    (code >= 0xFE30 && code <= 0xFE6F) ||
+    (code >= 0xFF00 && code <= 0xFF60) ||
+    (code >= 0xFFE0 && code <= 0xFFE6) ||
+    (code >= 0x20000 && code <= 0x2FFFF) ||
+    (code >= 0x2300 && code <= 0x23FF) ||
+    (code >= 0x2600 && code <= 0x27BF) ||
+    (code >= 0x1F000 && code <= 0x1FAFF)
+  );
+}
+
+function displayWidth(str: string): number {
+  let width = 0;
+  for (const char of str) {
+    const code = char.codePointAt(0) || 0;
+    width += isWideChar(code) ? 2 : 1;
+  }
+  return width;
+}
+
+const TAG_INNER_WIDTH = Math.max(displayWidth(ASSISTANT_NAME), 6);
+
+function padTag(name: string): string {
+  const nameWidth = displayWidth(name);
+  const totalPad = TAG_INNER_WIDTH - nameWidth;
+  if (totalPad <= 0) return `[${name}]`;
+  const leftPad = Math.floor(totalPad / 2);
+  const rightPad = totalPad - leftPad;
+  return `[${' '.repeat(leftPad)}${name}${' '.repeat(rightPad)}]`;
+}
+
+const AGENT_TAG = padTag(ASSISTANT_NAME);
+const TAG_PAD = ' '.repeat(displayWidth(AGENT_TAG));
 
 /**
  * Translate a JID from LID format to phone format.
@@ -270,9 +315,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
-  // Show user messages in dashboard before agent starts thinking
+  // Show user messages in dashboard
   for (const m of missedMessages) {
-    pushThinkingLine(`[${group.name}] ${m.sender_name}: ${m.content.split('\n')[0]}`);
+    const senderTag = padTag(m.sender_name);
+    pushThinkingLine(`${senderTag} ${m.content.split('\n')[0]}`);
   }
 
   await setTyping(chatJid, true);
@@ -341,6 +387,7 @@ async function runAgent(
   );
 
   try {
+    let isFirstAgentLine = true;
     const output = await runAgentForGroup({
       prompt,
       sessionId,
@@ -348,23 +395,33 @@ async function runAgent(
       chatJid,
       isMain,
       onProgress: (event) => {
-        const prefix = `[${group.name}] `;
         if (event.type === 'text') {
           const firstLine = event.text.split('\n')[0];
           if (firstLine.trim()) {
-            pushThinkingLine(`${prefix}${firstLine}`);
+            if (isFirstAgentLine) {
+              pushThinkingLine(`${AGENT_TAG} ${firstLine}`);
+              isFirstAgentLine = false;
+            } else {
+              pushThinkingLine(`${TAG_PAD} ${firstLine}`);
+            }
           }
         } else if (event.type === 'tool_use') {
-          pushThinkingLine(`${prefix}\u21BB ${event.text}`);
+          pushThinkingLine(`${TAG_PAD} \x1b[36m\u21BB ${event.text}\x1b[0m`);
         } else if (event.type === 'tool_summary') {
-          pushThinkingLine(`${prefix}${event.text}`);
+          pushThinkingLine(`${TAG_PAD} \x1b[2m${event.text}\x1b[0m`);
         }
       },
     });
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      // Use lock to prevent race condition on session updates
+      const lock = sessionLocks.get(group.folder) || Promise.resolve();
+      const newLock = lock.then(async () => {
+        sessions[group.folder] = output.newSessionId!;
+        setSession(group.folder, output.newSessionId!);
+      });
+      sessionLocks.set(group.folder, newLock);
+      await newLock;
     }
 
     if (output.status === 'error') {
@@ -385,7 +442,12 @@ async function runAgent(
 
 async function sendMessage(jid: string, text: string): Promise<void> {
   try {
-    await sock.sendMessage(jid, { text });
+    const result = await sock.sendMessage(jid, { text });
+    // Track sent message ID to prevent echo-back loops
+    if (result?.key?.id) {
+      sentMessageIds.add(result.key.id);
+      setTimeout(() => sentMessageIds.delete(result.key.id!), 60000);
+    }
     logger.info({ jid, length: text.length }, 'Message sent');
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
@@ -435,8 +497,11 @@ function startIpcWatcher(): void {
             .filter((f) => f.endsWith('.json'));
           for (const file of messageFiles) {
             const filePath = path.join(messagesDir, file);
+            const processingPath = `${filePath}.processing`;
             try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              // Atomically rename to .processing to prevent duplicate processing
+              fs.renameSync(filePath, processingPath);
+              const data = JSON.parse(fs.readFileSync(processingPath, 'utf-8'));
               if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
@@ -459,7 +524,7 @@ function startIpcWatcher(): void {
                   );
                 }
               }
-              fs.unlinkSync(filePath);
+              fs.unlinkSync(processingPath);
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
@@ -467,10 +532,14 @@ function startIpcWatcher(): void {
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              // Move .processing file to error dir, or original if rename failed
+              const sourceFile = fs.existsSync(processingPath) ? processingPath : filePath;
+              if (fs.existsSync(sourceFile)) {
+                fs.renameSync(
+                  sourceFile,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              }
             }
           }
         }
@@ -489,11 +558,14 @@ function startIpcWatcher(): void {
             .filter((f) => f.endsWith('.json'));
           for (const file of taskFiles) {
             const filePath = path.join(tasksDir, file);
+            const processingPath = `${filePath}.processing`;
             try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              // Atomically rename to .processing to prevent duplicate processing
+              fs.renameSync(filePath, processingPath);
+              const data = JSON.parse(fs.readFileSync(processingPath, 'utf-8'));
               // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(data, sourceGroup, isMain);
-              fs.unlinkSync(filePath);
+              fs.unlinkSync(processingPath);
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
@@ -501,10 +573,14 @@ function startIpcWatcher(): void {
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              // Move .processing file to error dir, or original if rename failed
+              const sourceFile = fs.existsSync(processingPath) ? processingPath : filePath;
+              if (fs.existsSync(sourceFile)) {
+                fs.renameSync(
+                  sourceFile,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              }
             }
           }
         }
@@ -836,12 +912,21 @@ async function connectWhatsApp(): Promise<void> {
 
   sock.ev.on('creds.update', saveCreds);
 
+  let messageHandlerErrorCount = 0;
+  const MAX_MESSAGE_ERRORS = 10;
+
   sock.ev.on('messages.upsert', ({ messages }) => {
     (async () => {
       for (const msg of messages) {
         if (!msg.message) continue;
         const rawJid = msg.key.remoteJid;
         if (!rawJid || rawJid === 'status@broadcast') continue;
+
+        // Skip echo-backs of messages we sent
+        if (msg.key.id && sentMessageIds.has(msg.key.id)) {
+          sentMessageIds.delete(msg.key.id);
+          continue;
+        }
 
         // Translate LID JID to phone JID if applicable
         const chatJid = await translateJid(rawJid);
@@ -863,8 +948,18 @@ async function connectWhatsApp(): Promise<void> {
           );
         }
       }
+      // Reset error count on success
+      messageHandlerErrorCount = 0;
     })().catch((err) => {
-      logger.error({ err }, 'Error in messages.upsert handler');
+      messageHandlerErrorCount++;
+      logger.error(
+        { err, errorCount: messageHandlerErrorCount },
+        'Error in messages.upsert handler',
+      );
+      if (messageHandlerErrorCount >= MAX_MESSAGE_ERRORS) {
+        logger.fatal('Too many message handler errors, shutting down');
+        process.exit(1);
+      }
     });
   });
 }
@@ -972,6 +1067,7 @@ async function main(): Promise<void> {
 
     clearTimeout(forceExitTimer);
     destroyDashboard();
+    closeDatabase();
     process.exit(0);
   };
 

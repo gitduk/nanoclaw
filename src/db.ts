@@ -257,7 +257,9 @@ export function getNewMessages(
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
-    if (row.timestamp > newTimestamp) newTimestamp = row.timestamp;
+    if (row.timestamp && row.timestamp > newTimestamp) {
+      newTimestamp = row.timestamp;
+    }
   }
 
   return { messages: rows, newTimestamp };
@@ -575,5 +577,15 @@ function migrateJsonState(): void {
     for (const [jid, group] of Object.entries(groups)) {
       setRegisteredGroup(jid, group);
     }
+  }
+}
+
+/**
+ * Close the database connection.
+ * Should be called during application shutdown.
+ */
+export function closeDatabase(): void {
+  if (db) {
+    db.close();
   }
 }

@@ -49,8 +49,12 @@ async function runTask(
 
   if (!group) {
     logger.error(
-      { taskId: task.id, groupFolder: task.group_folder },
-      'Group not found for task',
+      {
+        taskId: task.id,
+        groupFolder: task.group_folder,
+        availableGroups: Object.values(groups).map(g => g.folder)
+      },
+      'Group not found for task - group may have been deleted or not registered',
     );
     logTaskRun({
       task_id: task.id,
@@ -102,7 +106,7 @@ async function runTask(
       error = output.error || 'Unknown error';
     } else if (output.result) {
       if (output.result.outputType === 'message' && output.result.userMessage) {
-        await deps.sendMessage(task.chat_jid, `${ASSISTANT_NAME}: ${output.result.userMessage}`);
+        await deps.sendMessage(task.chat_jid, output.result.userMessage);
       }
       result = output.result.userMessage || output.result.internalLog || null;
     }
@@ -154,6 +158,11 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
     logger.debug('Scheduler loop already running, skipping duplicate start');
     return;
+  }
+  if (schedulerTimer !== null) {
+    logger.warn('Scheduler timer already exists, clearing before start');
+    clearTimeout(schedulerTimer);
+    schedulerTimer = null;
   }
   schedulerRunning = true;
   logger.info('Scheduler loop started');

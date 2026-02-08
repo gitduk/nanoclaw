@@ -188,7 +188,10 @@ export class GroupQueue {
       return;
     }
 
-    const delayMs = BASE_RETRY_MS * Math.pow(2, state.retryCount - 1);
+    const delayMs = Math.min(
+      BASE_RETRY_MS * Math.pow(2, state.retryCount - 1),
+      60000 // Max 1 minute
+    );
     logger.info(
       { groupJid, retryCount: state.retryCount, delayMs },
       'Scheduling retry with backoff',
@@ -207,8 +210,11 @@ export class GroupQueue {
 
     // Tasks first (they won't be re-discovered from SQLite like messages)
     if (state.pendingTasks.length > 0) {
-      const task = state.pendingTasks.shift()!;
-      this.runTask(groupJid, task);
+      // Defensive: copy and shift atomically
+      const task = state.pendingTasks.shift();
+      if (task) {
+        this.runTask(groupJid, task);
+      }
       return;
     }
 
@@ -232,8 +238,10 @@ export class GroupQueue {
 
       // Prioritize tasks over messages
       if (state.pendingTasks.length > 0) {
-        const task = state.pendingTasks.shift()!;
-        this.runTask(nextJid, task);
+        const task = state.pendingTasks.shift();
+        if (task) {
+          this.runTask(nextJid, task);
+        }
       } else if (state.pendingMessages) {
         this.runForGroup(nextJid, 'drain');
       }
