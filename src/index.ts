@@ -406,7 +406,7 @@ async function runAgent(
             }
           }
         } else if (event.type === 'tool_use') {
-          pushThinkingLine(`${TAG_PAD} \x1b[36m\u21BB ${event.text}\x1b[0m`);
+          pushThinkingLine(`${TAG_PAD} \x1b[36m${event.text}\x1b[0m`);
         } else if (event.type === 'tool_summary') {
           pushThinkingLine(`${TAG_PAD} \x1b[2m${event.text}\x1b[0m`);
         }
