@@ -24,6 +24,14 @@ import {
   TRIGGER_PATTERN,
 } from './config.js';
 import {
+  addConfig,
+  getCurrentConfig,
+  getCurrentConfigName,
+  listConfigs,
+  removeConfig,
+  switchConfig,
+} from './api-config.js';
+import {
   destroyDashboard,
   formatDiffLines,
   formatToolHeader,
@@ -628,6 +636,93 @@ function startIpcWatcher(): void {
   logger.info('IPC watcher started (per-group namespaces)');
 }
 
+async function handleApiConfigRequest(data: {
+  action?: string;
+  name?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  description?: string;
+}): Promise<void> {
+  try {
+    switch (data.action) {
+      case 'list': {
+        const configs = listConfigs();
+        const current = getCurrentConfigName();
+        logger.info({ configs, current }, 'API configurations');
+        pushThinkingLine(`Current: ${current}`);
+        for (const cfg of configs) {
+          const marker = cfg.name === current ? '→' : ' ';
+          pushThinkingLine(`${marker} ${cfg.name}: ${cfg.baseUrl} ${cfg.description ? `(${cfg.description})` : ''}`);
+        }
+        break;
+      }
+
+      case 'current': {
+        const config = getCurrentConfig();
+        const name = getCurrentConfigName();
+        logger.info({ name, config }, 'Current API configuration');
+        pushThinkingLine(`Current: ${name}`);
+        pushThinkingLine(`  Base URL: ${config.baseUrl}`);
+        pushThinkingLine(`  API Key: ${config.apiKey.slice(0, 10)}...`);
+        if (config.description) {
+          pushThinkingLine(`  Description: ${config.description}`);
+        }
+        break;
+      }
+
+      case 'switch': {
+        if (!data.name) {
+          logger.warn('switch_api_config: missing name');
+          pushThinkingLine('Error: name is required for switch action');
+          break;
+        }
+        const config = switchConfig(data.name);
+        logger.info({ name: data.name, config }, 'Switched API configuration');
+        pushThinkingLine(`Switched to: ${data.name}`);
+        pushThinkingLine(`  Base URL: ${config.baseUrl}`);
+        break;
+      }
+
+      case 'add': {
+        if (!data.name || !data.baseUrl || !data.apiKey) {
+          logger.warn('add_api_config: missing required fields');
+          pushThinkingLine('Error: name, base_url, and api_key are required for add action');
+          break;
+        }
+        addConfig({
+          name: data.name,
+          baseUrl: data.baseUrl,
+          apiKey: data.apiKey,
+          description: data.description
+        });
+        logger.info({ name: data.name }, 'Added API configuration');
+        pushThinkingLine(`Added config: ${data.name}`);
+        break;
+      }
+
+      case 'remove': {
+        if (!data.name) {
+          logger.warn('remove_api_config: missing name');
+          pushThinkingLine('Error: name is required for remove action');
+          break;
+        }
+        removeConfig(data.name);
+        logger.info({ name: data.name }, 'Removed API configuration');
+        pushThinkingLine(`Removed config: ${data.name}`);
+        break;
+      }
+
+      default:
+        logger.warn({ action: data.action }, 'Unknown api_config action');
+        pushThinkingLine(`Error: unknown action "${data.action}"`);
+    }
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.error({ err }, 'API config request failed');
+    pushThinkingLine(`Error: ${errorMsg}`);
+  }
+}
+
 async function processTaskIpc(
   data: {
     type: string;
@@ -644,6 +739,11 @@ async function processTaskIpc(
     name?: string;
     folder?: string;
     trigger?: string;
+    // For api_config
+    action?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    description?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -841,6 +941,18 @@ async function processTaskIpc(
           'Invalid register_group request - missing required fields',
         );
       }
+      break;
+
+    case 'api_config':
+      // Only main group can manage API configs
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized api_config attempt blocked',
+        );
+        break;
+      }
+      await handleApiConfigRequest(data);
       break;
 
     default:
