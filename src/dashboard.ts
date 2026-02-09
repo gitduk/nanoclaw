@@ -52,16 +52,27 @@ interface DashboardState {
   activeAgents: number;
   messageCount: number;
   startTime: number;
+  inputBuffer: string;
+  cursorPos: number;
+  inputMode: boolean;
 }
+
+type InputCallback = (input: string) => void;
+let inputCallback: InputCallback | null = null;
 
 const MAX_THINKING_LINES = 500;
 const RENDER_THROTTLE_MS = 50; // Max ~20fps to reduce flicker
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const thinkingBuffer: string[] = [];
 let active = false;
 let renderTimer: ReturnType<typeof setTimeout> | null = null;
 let lastRenderTime = 0;
 let uptimeTimer: ReturnType<typeof setInterval> | null = null;
 let logFileStream: fs.WriteStream | null = null;
+let spinnerText: string | null = null;
+let spinnerFrame = 0;
+let spinnerTimer: ReturnType<typeof setInterval> | null = null;
+let streamingLine: string | null = null;
 
 const originalConsole = {
   log: console.log,
@@ -77,6 +88,9 @@ const state: DashboardState = {
   activeAgents: 0,
   messageCount: 0,
   startTime: Date.now(),
+  inputBuffer: '',
+  cursorPos: 0,
+  inputMode: false,
 };
 
 // --- Public API ---
@@ -102,11 +116,7 @@ export function initDashboard(opts: { agentName: string; maxAgents: number }): v
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);
     process.stdin.resume();
-    process.stdin.on('data', (data: Buffer) => {
-      if (data[0] === 0x03) { // Ctrl+C
-        process.kill(process.pid, 'SIGINT');
-      }
-    });
+    process.stdin.on('data', handleInput);
   }
 
   // Safety net: restore terminal on exit
@@ -144,6 +154,10 @@ export function destroyDashboard(): void {
   if (renderTimer) {
     clearTimeout(renderTimer);
     renderTimer = null;
+  }
+  if (spinnerTimer) {
+    clearInterval(spinnerTimer);
+    spinnerTimer = null;
   }
 
   // Restore console
@@ -206,6 +220,122 @@ export function setActiveAgents(count: number): void {
   scheduleRender();
 }
 
+export function setInputCallback(callback: InputCallback): void {
+  inputCallback = callback;
+}
+
+export function enableInputMode(): void {
+  state.inputMode = true;
+  scheduleRender();
+}
+
+export function disableInputMode(): void {
+  state.inputMode = false;
+  state.inputBuffer = '';
+  state.cursorPos = 0;
+  scheduleRender();
+}
+
+export function setThinkingIndicator(text: string | null): void {
+  if (text) {
+    spinnerText = text;
+    spinnerFrame = 0;
+    if (!spinnerTimer) {
+      spinnerTimer = setInterval(() => {
+        spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
+        scheduleRender();
+      }, 80);
+    }
+  } else {
+    spinnerText = null;
+    if (spinnerTimer) {
+      clearInterval(spinnerTimer);
+      spinnerTimer = null;
+    }
+  }
+  scheduleRender();
+}
+
+export function setStreamingLine(line: string | null): void {
+  streamingLine = line;
+  scheduleRender();
+}
+
+function handleInput(data: Buffer): void {
+  // Ctrl+C
+  if (data[0] === 0x03) {
+    process.kill(process.pid, 'SIGINT');
+    return;
+  }
+
+  // Ctrl+D (toggle input mode)
+  if (data[0] === 0x04) {
+    state.inputMode = !state.inputMode;
+    if (!state.inputMode) {
+      state.inputBuffer = '';
+      state.cursorPos = 0;
+    }
+    scheduleRender();
+    return;
+  }
+
+  if (!state.inputMode) return;
+
+  const str = data.toString('utf8');
+
+  // Enter key
+  if (str === '\r' || str === '\n') {
+    if (state.inputBuffer.trim() && inputCallback) {
+      inputCallback(state.inputBuffer.trim());
+    }
+    state.inputBuffer = '';
+    state.cursorPos = 0;
+    scheduleRender();
+    return;
+  }
+
+  // Backspace
+  if (data[0] === 0x7f || data[0] === 0x08) {
+    if (state.cursorPos > 0) {
+      state.inputBuffer =
+        state.inputBuffer.slice(0, state.cursorPos - 1) +
+        state.inputBuffer.slice(state.cursorPos);
+      state.cursorPos--;
+      scheduleRender();
+    }
+    return;
+  }
+
+  // Arrow keys
+  if (data[0] === 0x1b && data[1] === 0x5b) {
+    if (data[2] === 0x44) { // Left arrow
+      if (state.cursorPos > 0) {
+        state.cursorPos--;
+        scheduleRender();
+      }
+      return;
+    }
+    if (data[2] === 0x43) { // Right arrow
+      if (state.cursorPos < state.inputBuffer.length) {
+        state.cursorPos++;
+        scheduleRender();
+      }
+      return;
+    }
+    return;
+  }
+
+  // Regular characters
+  if (str.length > 0 && str.charCodeAt(0) >= 32) {
+    state.inputBuffer =
+      state.inputBuffer.slice(0, state.cursorPos) +
+      str +
+      state.inputBuffer.slice(state.cursorPos);
+    state.cursorPos += str.length;
+    scheduleRender();
+  }
+}
+
 /** Write a line to the log file only (no dashboard display). */
 function writeLogFile(line: string): void {
   if (!logFileStream) return;
@@ -234,6 +364,9 @@ export function pushThinkingLine(line: string): void {
         thinkingBuffer.push(w);
       }
       logFileStream?.write(l + '\n');
+    } else {
+      // Allow blank separator lines
+      thinkingBuffer.push('');
     }
   }
   if (thinkingBuffer.length >= MAX_THINKING_LINES) {
@@ -339,10 +472,11 @@ function render(): void {
 
   // Thinking section
   buf.push(boxMid(width, ` ${state.agentName} `));
-  const chromeLines = buf.length + 1; // +1 for bottom border
+  const inputLines = state.inputMode ? 3 : 0; // Input box takes 3 lines when active
+  const chromeLines = buf.length + 1 + inputLines; // +1 for bottom border
   const thinkingHeight = Math.max(1, height - chromeLines);
 
-  if (thinkingBuffer.length === 0) {
+  if (thinkingBuffer.length === 0 && !spinnerText && !streamingLine) {
     buf.push(boxRow(innerW, `  ${DIM}Waiting for messages...${RESET}`));
     for (let i = 1; i < thinkingHeight; i++) {
       buf.push(boxRow(innerW, ''));
@@ -352,10 +486,35 @@ function render(): void {
     for (const line of visibleLines) {
       buf.push(boxRow(innerW, `  ${truncate(line, innerW - 2)}`));
     }
-    for (let i = visibleLines.length; i < thinkingHeight; i++) {
+    let usedLines = visibleLines.length;
+    // Real-time streaming line (current incomplete text from agent)
+    if (streamingLine && usedLines < thinkingHeight) {
+      buf.push(boxRow(innerW, `  ${truncate(streamingLine, innerW - 2)}`));
+      usedLines++;
+    }
+    // Animated spinner while agent is thinking
+    if (spinnerText && usedLines < thinkingHeight) {
+      buf.push(boxRow(innerW, `  ${DIM}${SPINNER_FRAMES[spinnerFrame]} ${spinnerText}${RESET}`));
+      usedLines++;
+    }
+    for (let i = usedLines; i < thinkingHeight; i++) {
       buf.push(boxRow(innerW, ''));
     }
   }
+
+  // Input box (if enabled)
+  if (state.inputMode) {
+    buf.push(boxMid(width, ' Input '));
+    const prompt = '> ';
+    const displayText = state.inputBuffer;
+    const cursorIndicator = state.inputMode ? '█' : '';
+    const beforeCursor = displayText.slice(0, state.cursorPos);
+    const afterCursor = displayText.slice(state.cursorPos);
+    const inputLine = `  ${prompt}${beforeCursor}${cursorIndicator}${afterCursor}`;
+    buf.push(boxRow(innerW, truncate(inputLine, innerW)));
+    buf.push(boxRow(innerW, `  ${DIM}Ctrl+D: toggle input | Enter: send | Ctrl+C: exit${RESET}`));
+  }
+
   buf.push(boxBottom(width));
 
   // Synchronized output prevents flicker; auto-wrap off prevents overflow from
@@ -475,4 +634,150 @@ function formatUptime(): string {
   if (hours > 0) return `${hours}h ${minutes % 60}m`;
   if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
   return `${seconds}s`;
+}
+
+// --- Claude Code-style Formatting ---
+
+const CONNECTOR = '\u23bf';  // ⎿
+const DIFF_INDENT = '   ';   // 3 spaces to align under tool header text
+
+/**
+ * Format a tool call header: ⎿  Read src/config.ts
+ * The render function adds 2-space prefix, so on screen it shows: "  ⎿  Read src/config.ts"
+ */
+export function formatToolHeader(summary: string): string {
+  return `${DIM}${CONNECTOR}${RESET}  ${CYAN}${summary}${RESET}`;
+}
+
+/**
+ * Format Edit diff lines with red (removed) / green (added) coloring.
+ * Returns array of formatted strings ready for pushThinkingLine().
+ */
+export function formatDiffLines(oldStr: string, newStr: string): string[] {
+  const oldLines = oldStr ? oldStr.replace(/\n$/, '').split('\n') : [];
+  const newLines = newStr ? newStr.replace(/\n$/, '').split('\n') : [];
+
+  // Guard: skip diff for very large edits
+  if (oldLines.length > 100 || newLines.length > 100) {
+    return [`${DIFF_INDENT}${DIM}(large edit: ${oldLines.length} lines \u2192 ${newLines.length} lines)${RESET}`];
+  }
+
+  const diff = computeLineDiff(oldLines, newLines);
+  const maxWidth = (process.stdout.columns || 80) - 14;  // account for borders + indent + prefix
+  const MAX_DIFF_LINES = 20;
+  const lines: string[] = [];
+  let displayed = 0;
+
+  for (const entry of diff) {
+    if (displayed >= MAX_DIFF_LINES) {
+      const remaining = diff.length - displayed;
+      if (remaining > 0) {
+        lines.push(`${DIFF_INDENT}${DIM}... ${remaining} more lines${RESET}`);
+      }
+      break;
+    }
+    const text = truncate(entry.text, maxWidth);
+    if (entry.type === 'remove') {
+      lines.push(`${DIFF_INDENT}${RED}- ${text}${RESET}`);
+    } else if (entry.type === 'add') {
+      lines.push(`${DIFF_INDENT}${GREEN}+ ${text}${RESET}`);
+    } else if (entry.text === '...') {
+      lines.push(`${DIFF_INDENT}${DIM}  ...${RESET}`);
+    } else {
+      lines.push(`${DIFF_INDENT}${DIM}  ${text}${RESET}`);
+    }
+    displayed++;
+  }
+
+  return lines;
+}
+
+/**
+ * Format tool result/summary text, indented under the tool block.
+ */
+export function formatToolResult(summary: string): string[] {
+  const maxWidth = (process.stdout.columns || 80) - 14;
+  const lines: string[] = [];
+
+  for (const line of summary.split('\n').slice(0, 5)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const text = truncate(trimmed, maxWidth);
+    lines.push(`${DIFF_INDENT}${DIM}${text}${RESET}`);
+  }
+
+  return lines;
+}
+
+// --- LCS Line Diff ---
+
+interface DiffEntry {
+  type: 'add' | 'remove' | 'context';
+  text: string;
+}
+
+function computeLineDiff(oldLines: string[], newLines: string[]): DiffEntry[] {
+  const m = oldLines.length;
+  const n = newLines.length;
+
+  // Build LCS table
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack to produce diff entries
+  const stack: DiffEntry[] = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      stack.push({ type: 'context', text: oldLines[i - 1] });
+      i--; j--;
+    } else if (i > 0 && (j === 0 || dp[i - 1][j] >= dp[i][j - 1])) {
+      stack.push({ type: 'remove', text: oldLines[i - 1] });
+      i--;
+    } else {
+      stack.push({ type: 'add', text: newLines[j - 1] });
+      j--;
+    }
+  }
+  stack.reverse();
+
+  // Filter: show only changed lines + 1 line of context around changes
+  return filterContext(stack, 1);
+}
+
+function filterContext(entries: DiffEntry[], contextLines: number): DiffEntry[] {
+  const isChange = entries.map(e => e.type !== 'context');
+  const include = new Array(entries.length).fill(false);
+
+  for (let i = 0; i < entries.length; i++) {
+    if (isChange[i]) {
+      include[i] = true;
+      for (let c = 1; c <= contextLines; c++) {
+        if (i - c >= 0) include[i - c] = true;
+        if (i + c < entries.length) include[i + c] = true;
+      }
+    }
+  }
+
+  // Insert '...' separators between non-contiguous regions
+  const result: DiffEntry[] = [];
+  let lastIdx = -1;
+  for (let i = 0; i < entries.length; i++) {
+    if (include[i]) {
+      if (lastIdx >= 0 && i - lastIdx > 1) {
+        result.push({ type: 'context', text: '...' });
+      }
+      result.push(entries[i]);
+      lastIdx = i;
+    }
+  }
+  return result;
 }
