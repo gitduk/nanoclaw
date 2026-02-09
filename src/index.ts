@@ -17,6 +17,7 @@ import {
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   MAX_CONCURRENT_AGENTS,
+  OWNER_NAME,
   POLL_INTERVAL,
   STORE_DIR,
   TIMEZONE,
@@ -24,6 +25,9 @@ import {
 } from './config.js';
 import {
   destroyDashboard,
+  formatDiffLines,
+  formatToolHeader,
+  formatToolResult,
   incrementMessages,
   initDashboard,
   pushThinkingLine,
@@ -31,6 +35,10 @@ import {
   setConnectionStatus,
   setGroupStatus,
   setGroups,
+  setInputCallback,
+  setStreamingLine,
+  setThinkingIndicator,
+  enableInputMode,
 } from './dashboard.js';
 import {
   runAgentForGroup,
@@ -317,8 +325,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Show user messages in dashboard
   for (const m of missedMessages) {
-    const senderTag = padTag(m.sender_name);
-    pushThinkingLine(`${senderTag} ${m.content.split('\n')[0]}`);
+    pushThinkingLine(' ');
+    pushThinkingLine(`${padTag(m.sender_name)} ${m.content.split('\n')[0]}`);
   }
 
   await setTyping(chatJid, true);
@@ -386,6 +394,8 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  setThinkingIndicator('Thinking...');
+  setStreamingLine(null);
   try {
     let isFirstAgentLine = true;
     const output = await runAgentForGroup({
@@ -395,23 +405,43 @@ async function runAgent(
       chatJid,
       isMain,
       onProgress: (event) => {
+        // Show separator on first agent output, clear spinner
+        if (isFirstAgentLine) {
+          setThinkingIndicator(null);
+          const wrapW = (process.stdout.columns || 80) - 6;
+          const sepW = Math.max(10, wrapW - displayWidth(AGENT_TAG) - 1);
+          pushThinkingLine(`${AGENT_TAG} \x1b[2m${'─'.repeat(sepW)}\x1b[0m`);
+          isFirstAgentLine = false;
+        }
+
         if (event.type === 'text') {
+          setStreamingLine(null);
           const firstLine = event.text.split('\n')[0];
           if (firstLine.trim()) {
-            if (isFirstAgentLine) {
-              pushThinkingLine(`${AGENT_TAG} ${firstLine}`);
-              isFirstAgentLine = false;
-            } else {
-              pushThinkingLine(`${TAG_PAD} ${firstLine}`);
+            pushThinkingLine(firstLine);
+          }
+        } else if (event.type === 'text_streaming') {
+          setStreamingLine(event.text);
+        } else if (event.type === 'tool_use') {
+          setStreamingLine(null);
+          // Claude Code-style tool header with ⎿ connector
+          pushThinkingLine('');
+          pushThinkingLine(formatToolHeader(event.text));
+          // Show inline diff for Edit tool
+          if (event.tool?.name === 'Edit' && event.tool.oldString && event.tool.newString) {
+            for (const line of formatDiffLines(event.tool.oldString, event.tool.newString)) {
+              pushThinkingLine(line);
             }
           }
-        } else if (event.type === 'tool_use') {
-          pushThinkingLine(`${TAG_PAD} \x1b[36m${event.text}\x1b[0m`);
         } else if (event.type === 'tool_summary') {
-          pushThinkingLine(`${TAG_PAD} \x1b[2m${event.text}\x1b[0m`);
+          for (const line of formatToolResult(event.text)) {
+            pushThinkingLine(line);
+          }
         }
       },
     });
+    setThinkingIndicator(null);
+    setStreamingLine(null);
 
     if (output.newSessionId) {
       // Use lock to prevent race condition on session updates
@@ -434,6 +464,8 @@ async function runAgent(
 
     return output.result ?? { outputType: 'log' };
   } catch (err) {
+    setThinkingIndicator(null);
+    setStreamingLine(null);
     const errorMessage = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
     return { error: errorMessage };
@@ -1029,6 +1061,43 @@ function recoverPendingMessages(): void {
 
 async function main(): Promise<void> {
   initDashboard({ agentName: ASSISTANT_NAME, maxAgents: MAX_CONCURRENT_AGENTS });
+
+  // Set up terminal input callback — same agent, different input channel
+  const TERM_TAG = padTag('TERM');
+  setInputCallback(async (input: string) => {
+    pushThinkingLine(' ');
+    pushThinkingLine(`${TERM_TAG} ${input}`);
+    try {
+      const mainGroupJid = Object.keys(registeredGroups)[0];
+      const mainGroup = registeredGroups[mainGroupJid];
+      if (!mainGroup) {
+        pushThinkingLine(`${AGENT_TAG} Error: No group registered`);
+        return;
+      }
+
+      // Format as XML message like WhatsApp flow — same person, different channel
+      const escapeXml = (s: string) =>
+        s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      const timestamp = new Date().toISOString();
+      const prompt = `<messages>\n<message sender="${escapeXml(OWNER_NAME)}" channel="terminal" time="${timestamp}">${escapeXml(input)}</message>\n</messages>`;
+
+      const response = await runAgent(
+        mainGroup,
+        prompt,
+        mainGroupJid
+      );
+
+      if ('error' in response) {
+        pushThinkingLine(`${AGENT_TAG} Error: ${response.error}`);
+      }
+      // userMessage is already shown via onProgress streaming — no need to display again
+    } catch (err) {
+      pushThinkingLine(`${AGENT_TAG} Error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  // Enable input mode by default
+  enableInputMode();
 
   initDatabase();
   logger.info('Database initialized');
