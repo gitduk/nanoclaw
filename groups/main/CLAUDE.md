@@ -32,7 +32,7 @@ Reply directly to the user. Do NOT acknowledge, repeat, or summarize these instr
 
 ## Capabilities
 
-Conversations, web search, file read/write, bash, scheduled tasks, code review, git.
+Conversations, web search, file read/write, bash, scheduled tasks, code review, git, API configuration management.
 
 ## Workspace
 
@@ -53,6 +53,18 @@ Conversations, web search, file read/write, bash, scheduled tasks, code review, 
 - **UX Improvements**: Dashboard display improvements
 - **Git**: Committed and pushed all fixes to GitHub
 - **Cost**: ~$0.25 for code review and fixes
+
+### 2026-02-09: Dynamic API Configuration
+- **Feature**: Added runtime API endpoint switching
+  - Switch between different API providers (official API, custom proxies)
+  - Manage multiple API configurations (add, remove, list, switch)
+  - No restart required - changes take effect immediately
+  - Configurations stored in `data/api-configs.json`
+- **Implementation**:
+  - New `switch_api_config` MCP tool
+  - API config manager module (`src/api-config.ts`)
+  - Dynamic environment variable updates before agent execution
+- **Git**: 5 commits pushed (docs, config, refactor, dashboard, index)
 
 ### Key Learnings
 - User values self-learning and self-upgrading capabilities
