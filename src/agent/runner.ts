@@ -26,26 +26,6 @@ export interface AgentResponse {
   internalLog?: string;
 }
 
-const AGENT_RESPONSE_SCHEMA = {
-  type: 'object',
-  properties: {
-    outputType: {
-      type: 'string',
-      enum: ['message', 'log'],
-      description: '"message": the userMessage field contains a message to send to the user or group. "log": the output will not be sent to the user or group.',
-    },
-    userMessage: {
-      type: 'string',
-      description: 'A message to send to the user or group. Include when outputType is "message".',
-    },
-    internalLog: {
-      type: 'string',
-      description: 'Information that will be logged internally but not sent to the user or group.',
-    },
-  },
-  required: ['outputType'],
-} as const;
-
 export interface AgentOutput {
   status: 'success' | 'error';
   result: AgentResponse | null;
@@ -55,23 +35,26 @@ export interface AgentOutput {
 
 export type OnProgressCallback = (event: AgentProgressEvent) => void;
 
-export interface AgentProgressEvent {
-  type: 'text' | 'tool_use' | 'tool_summary';
-  text: string;
+export interface ToolEventData {
+  name: string;
+  filePath?: string;
+  command?: string;
+  description?: string;
+  pattern?: string;
+  query?: string;
+  url?: string;
+  oldString?: string;  // Edit only
+  newString?: string;  // Edit only
 }
 
-// Filter noise text that the model emits before StructuredOutput
-const NOISE_PATTERNS = [
-  /^no response requested\.?$/i,
-  /^i'?ll? log this internally\.?$/i,
-  /^logging internally\.?$/i,
-  /^i'?ll? set the output ?type to "?log"?\.?$/i,
-];
+export interface AgentProgressEvent {
+  type: 'text' | 'text_streaming' | 'tool_use' | 'tool_summary';
+  text: string;
+  tool?: ToolEventData;
+}
 
 function isNoiseText(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed) return true;
-  return NOISE_PATTERNS.some(p => p.test(trimmed));
+  return !text.trim();
 }
 
 interface SessionEntry {
@@ -239,7 +222,6 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
   let textBuffer = '';  // Accumulate streaming text
   let currentToolName = '';  // Current tool being called
   let currentToolInput = '';  // Accumulate tool input JSON
-  let insideStructuredOutput = false;  // Suppress output during StructuredOutput
 
   // Add context for scheduled tasks
   let prompt = input.prompt;
@@ -282,10 +264,6 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
             },
             hooks: {
               PreCompact: [{ hooks: [createPreCompactHook(input.workspaceDir)] }]
-            },
-            outputFormat: {
-              type: 'json_schema',
-              schema: AGENT_RESPONSE_SCHEMA,
             }
           }
         })) {
@@ -297,19 +275,15 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
       if (onProgress) {
         if (message.type === 'stream_event') {
           const event = (message as any).event;
-          // Handle tool use start - record the name, detect StructuredOutput
+          // Handle tool use start
           if (event?.type === 'content_block_start' && event?.content_block?.type === 'tool_use') {
             currentToolName = event.content_block.name || '';
             currentToolInput = '';
-            if (currentToolName === 'StructuredOutput') {
-              insideStructuredOutput = true;
-            }
           }
-          // Handle streaming text deltas - accumulate until newline or sentence end
+          // Handle streaming text deltas - flush complete lines, stream incomplete line in real-time
           else if (event?.type === 'content_block_delta' && event?.delta?.type === 'text_delta') {
-            if (insideStructuredOutput) continue;  // Skip StructuredOutput text
             textBuffer += event.delta.text || '';
-            // Flush on newlines
+            // Flush complete lines (before last newline)
             const lines = textBuffer.split('\n');
             for (let i = 0; i < lines.length - 1; i++) {
               const line = lines[i].trim();
@@ -318,95 +292,87 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
               }
             }
             textBuffer = lines[lines.length - 1];
-            // Also flush if buffer is long enough (for responses without newlines)
-            if (textBuffer.length > 80) {
-              let breakPoint = textBuffer.lastIndexOf('。');
-              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf('. ');
-              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf('，');
-              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf(', ');
-              if (breakPoint < 40) breakPoint = textBuffer.lastIndexOf(' ');
-              if (breakPoint > 40) {
-                const chunk = textBuffer.slice(0, breakPoint + 1).trim();
-                if (!isNoiseText(chunk)) {
-                  onProgress({ type: 'text', text: chunk });
-                }
-                textBuffer = textBuffer.slice(breakPoint + 1);
-              }
+            // Stream the incomplete line in real-time for live display
+            if (textBuffer.trim()) {
+              onProgress({ type: 'text_streaming', text: textBuffer });
             }
           }
           // Handle tool input JSON accumulation
           else if (event?.type === 'content_block_delta' && event?.delta?.type === 'input_json_delta') {
-            if (!insideStructuredOutput) {
-              currentToolInput += event.delta.partial_json || '';
-            }
+            currentToolInput += event.delta.partial_json || '';
           }
           // Handle content block end - flush text or emit tool info
           else if (event?.type === 'content_block_stop') {
-            if (insideStructuredOutput) {
-              insideStructuredOutput = false;
-              currentToolName = '';
-              currentToolInput = '';
-              continue;
-            }
             // Flush remaining text
             if (textBuffer.trim() && !isNoiseText(textBuffer)) {
               onProgress({ type: 'text', text: textBuffer.trim() });
             }
             textBuffer = '';
-            // Emit tool with parsed input summary
+            // Emit tool with parsed input summary and structured data
             if (currentToolName) {
               let toolSummary = currentToolName;
+              let toolData: ToolEventData = { name: currentToolName };
               try {
                 const input = JSON.parse(currentToolInput || '{}');
                 if (currentToolName === 'Read' && input.file_path) {
                   toolSummary = `Read ${input.file_path}`;
+                  toolData = { name: 'Read', filePath: input.file_path };
                 } else if (currentToolName === 'Bash' && input.command) {
                   const cmd = input.command.split('\n')[0];
                   toolSummary = `$ ${cmd.length > 60 ? cmd.slice(0, 60) + '...' : cmd}`;
+                  toolData = { name: 'Bash', command: input.command, description: input.description };
                 } else if (currentToolName === 'Grep' && input.pattern) {
                   toolSummary = `Grep "${input.pattern}"${input.path ? ` in ${input.path}` : ''}`;
+                  toolData = { name: 'Grep', pattern: input.pattern, filePath: input.path };
                 } else if (currentToolName === 'Glob' && input.pattern) {
                   toolSummary = `Glob ${input.pattern}`;
+                  toolData = { name: 'Glob', pattern: input.pattern, filePath: input.path };
                 } else if (currentToolName === 'Edit' && input.file_path) {
                   toolSummary = `Edit ${input.file_path}`;
+                  toolData = {
+                    name: 'Edit',
+                    filePath: input.file_path,
+                    oldString: input.old_string,
+                    newString: input.new_string,
+                  };
                 } else if (currentToolName === 'Write' && input.file_path) {
                   toolSummary = `Write ${input.file_path}`;
+                  toolData = { name: 'Write', filePath: input.file_path };
                 } else if (currentToolName === 'WebSearch' && input.query) {
                   toolSummary = `Search: ${input.query}`;
+                  toolData = { name: 'WebSearch', query: input.query };
                 } else if (currentToolName === 'WebFetch' && input.url) {
                   toolSummary = `Fetch: ${input.url}`;
+                  toolData = { name: 'WebFetch', url: input.url };
                 } else if (currentToolName === 'TodoWrite') {
                   toolSummary = 'TodoWrite';
                 } else if (currentToolName.startsWith('mcp__nanoclaw__')) {
                   toolSummary = currentToolName.replace('mcp__nanoclaw__', '');
+                  toolData = { name: toolSummary };
                 }
               } catch {
                 // Keep just tool name if JSON parse fails
               }
-              onProgress({ type: 'tool_use', text: toolSummary });
+              onProgress({ type: 'tool_use', text: toolSummary, tool: toolData });
             }
             currentToolName = '';
             currentToolInput = '';
           }
         } else if (message.type === 'tool_use_summary') {
           const summary = (message as any).summary as string;
-          if (summary && !summary.includes('StructuredOutput')) {
+          if (summary) {
             onProgress({ type: 'tool_summary', text: summary });
           }
         }
       }
 
       if (message.type === 'result') {
-        if (message.subtype === 'success' && message.structured_output) {
-          result = message.structured_output as AgentResponse;
-          if (result.outputType === 'message' && !result.userMessage) {
-            result = { outputType: 'log', internalLog: result.internalLog };
-          }
-        } else if (message.subtype === 'success' || message.subtype === 'error_max_structured_output_retries') {
-          // Structured output missing or agent couldn't produce valid structured output — fall back to text
+        if (message.subtype === 'success') {
           const textResult = 'result' in message ? (message as { result?: string }).result : null;
-          if (textResult) {
+          if (textResult?.trim()) {
             result = { outputType: 'message', userMessage: textResult };
+          } else {
+            result = { outputType: 'log' };
           }
         }
       }
