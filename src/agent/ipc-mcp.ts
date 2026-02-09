@@ -313,6 +313,52 @@ Use available_groups.json to find the JID for a group. The folder name should be
             }]
           };
         }
+      ),
+
+      tool(
+        'switch_api_config',
+        `Switch the Anthropic API configuration (base URL and API key). Use this to switch between different API providers or endpoints.
+
+Actions:
+- "list": Show all available configurations
+- "switch": Switch to a different configuration
+- "add": Add a new configuration
+- "remove": Remove a configuration
+- "current": Show current configuration`,
+        {
+          action: z.enum(['list', 'switch', 'add', 'remove', 'current']).describe('Action to perform'),
+          name: z.string().optional().describe('Config name (required for switch/add/remove)'),
+          base_url: z.string().optional().describe('API base URL (required for add)'),
+          api_key: z.string().optional().describe('API key (required for add)'),
+          description: z.string().optional().describe('Description (optional for add)')
+        },
+        async (args) => {
+          if (!isMain) {
+            return {
+              content: [{ type: 'text', text: 'Only the main group can manage API configs.' }],
+              isError: true
+            };
+          }
+
+          const data = {
+            type: 'api_config',
+            action: args.action,
+            name: args.name,
+            baseUrl: args.base_url,
+            apiKey: args.api_key,
+            description: args.description,
+            timestamp: new Date().toISOString()
+          };
+
+          writeIpcFile(TASKS_DIR, data);
+
+          return {
+            content: [{
+              type: 'text',
+              text: `API config ${args.action} requested.`
+            }]
+          };
+        }
       )
     ]
   });
