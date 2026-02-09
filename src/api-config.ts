@@ -109,3 +109,45 @@ export function getCurrentConfigName(): string {
   const store = loadStore();
   return store.current;
 }
+
+/**
+ * Test if an API configuration is valid by making a simple API call
+ */
+export async function testApiConfig(config: ApiConfig): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const response = await fetch(`${config.baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': config.apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'test' }]
+      })
+    });
+
+    // Accept both 200 (success) and 400 (bad request but API is reachable)
+    // Reject 401 (unauthorized), 403 (forbidden), 404 (not found)
+    if (response.status === 401) {
+      return { valid: false, error: 'Invalid API key (401 Unauthorized)' };
+    }
+    if (response.status === 403) {
+      return { valid: false, error: 'Access forbidden (403 Forbidden)' };
+    }
+    if (response.status === 404) {
+      return { valid: false, error: 'API endpoint not found (404)' };
+    }
+    if (response.status >= 500) {
+      return { valid: false, error: `Server error (${response.status})` };
+    }
+
+    // 200 or 400 means API is reachable and key is valid
+    return { valid: true };
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    return { valid: false, error: `Connection failed: ${errorMsg}` };
+  }
+}

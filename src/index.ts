@@ -30,6 +30,7 @@ import {
   listConfigs,
   removeConfig,
   switchConfig,
+  testApiConfig,
 } from './api-config.js';
 import {
   destroyDashboard,
@@ -676,10 +677,33 @@ async function handleApiConfigRequest(data: {
           pushThinkingLine('Error: name is required for switch action');
           break;
         }
+
+        // Get the target config first (before switching)
+        const configs = listConfigs();
+        const targetConfig = configs.find(c => c.name === data.name);
+        if (!targetConfig) {
+          pushThinkingLine(`Error: config "${data.name}" not found`);
+          break;
+        }
+
+        // Test API validity before switching
+        pushThinkingLine(`Testing API config "${data.name}"...`);
+        const testResult = await testApiConfig(targetConfig);
+
+        if (!testResult.valid) {
+          logger.warn({ name: data.name, error: testResult.error }, 'API config test failed');
+          pushThinkingLine(`❌ API test failed: ${testResult.error}`);
+          pushThinkingLine('Config not switched. Please check the API key and base URL.');
+          break;
+        }
+
+        // Test passed, proceed with switch
         const config = switchConfig(data.name);
         logger.info({ name: data.name, config }, 'Switched API configuration');
+        pushThinkingLine(`✅ API test passed`);
         pushThinkingLine(`Switched to: ${data.name}`);
         pushThinkingLine(`  Base URL: ${config.baseUrl}`);
+        pushThinkingLine(`Note: Change takes effect on next agent execution`);
         break;
       }
 
@@ -689,13 +713,29 @@ async function handleApiConfigRequest(data: {
           pushThinkingLine('Error: name, base_url, and api_key are required for add action');
           break;
         }
-        addConfig({
+
+        const newConfig = {
           name: data.name,
           baseUrl: data.baseUrl,
           apiKey: data.apiKey,
           description: data.description
-        });
+        };
+
+        // Test API validity before adding
+        pushThinkingLine(`Testing API config "${data.name}"...`);
+        const testResult = await testApiConfig(newConfig);
+
+        if (!testResult.valid) {
+          logger.warn({ name: data.name, error: testResult.error }, 'API config test failed');
+          pushThinkingLine(`❌ API test failed: ${testResult.error}`);
+          pushThinkingLine('Config not added. Please check the API key and base URL.');
+          break;
+        }
+
+        // Test passed, add the config
+        addConfig(newConfig);
         logger.info({ name: data.name }, 'Added API configuration');
+        pushThinkingLine(`✅ API test passed`);
         pushThinkingLine(`Added config: ${data.name}`);
         break;
       }
