@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { createIpcMcp } from './ipc-mcp.js';
+import { getCurrentConfig } from '../api-config.js';
 
 export interface AgentInput {
   prompt: string;
@@ -231,6 +232,11 @@ export async function runAgent(input: AgentInput, onProgress?: OnProgressCallbac
 
   try {
     const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4.5';
+
+    // Get current API configuration and set environment variables
+    const apiConfig = getCurrentConfig();
+    process.env.ANTHROPIC_API_KEY = apiConfig.apiKey;
+    process.env.ANTHROPIC_BASE_URL = apiConfig.baseUrl;
 
     const AGENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
     const timeoutPromise = new Promise<never>((_, reject) => {
